@@ -1,0 +1,43 @@
+{
+  "name": "ai-test-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Plateforme universelle de tests E2E (Playwright + Claude) et tests de charge (K6) — intégrable dans tout pipeline CI/CD.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0",
+    "yarn": ">=1.22.0"
+  },
+  "main": "tests/universal-crawler.spec.js",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:crawler": "playwright test tests/universal-crawler.spec.js",
+    "test:report": "playwright show-report",
+    "docker:build": "docker compose build",
+    "docker:e2e": "docker compose run --rm ai-tester",
+    "docker:load": "docker compose run --rm load-tester run /tests/stress-test.js",
+    "docker:all": "docker compose run --rm ai-tester && docker compose run --rm load-tester run /tests/stress-test.js",
+    "lint": "eslint tests/ --max-warnings=0",
+    "format": "prettier --write \"**/*.{js,json,md,yml}\""
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.0",
+    "@playwright/test": "^1.49.0",
+    "dotenv": "^16.4.5",
+    "nodemailer": "^6.9.16"
+  },
+  "devDependencies": {
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2"
+  },
+  "keywords": [
+    "playwright",
+    "claude",
+    "ai-testing",
+    "e2e",
+    "k6",
+    "load-testing",
+    "ci-cd"
+  ]
+}

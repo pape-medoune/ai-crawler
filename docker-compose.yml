@@ -1,0 +1,141 @@
+# ============================================================
+#  AI Test Platform - Docker Compose
+# ------------------------------------------------------------
+#  Services :
+#    - ai-tester     : Playwright + @anthropic-ai/sdk (tests E2E IA)
+#    - load-tester   : Grafana K6 (tests de charge & scalabilite)
+# ============================================================
+#
+#  Demarrage rapide :
+#    cp .env.sample .env  &&  editer .env  (ANTHROPIC_API_KEY, SMTP_*)
+#    docker compose build
+#    docker compose run --rm ai-tester               # E2E IA seul
+#    docker compose run --rm load-tester             # K6 seul
+#    docker compose run --rm ai-tester && \
+#    docker compose run --rm load-tester             # Les deux a la suite
+#
+# ============================================================
+
+version: "3.9"
+
+# Volumes partages pour les artefacts (rapports HTML, JUnit, videos, JSON K6)
+volumes:
+  artifacts:
+    name: ai-test-platform-artifacts
+  results:
+    name: ai-test-platform-results
+  # Cache des navigateurs Playwright (accelere les redemarrages)
+  playwright-browsers:
+    name: ai-test-platform-pw-browsers
+
+# Reseau isole pour que les conteneurs de test communiquent entre eux
+# (ex : ai-tester peut frapper un service "app" du compose parent).
+networks:
+  test-net:
+    name: ai-test-platform-net
+    driver: bridge
+
+services:
+  # ------------------------------------------------------------
+  # ai-tester : Playwright + Claude (tests E2E autonomes)
+  # Image officielle Microsoft = Playwright + Chromium preinstalles
+  # ------------------------------------------------------------
+  ai-tester:
+    # Image officielle Microsoft Playwright (Node 20 + Chromium + Firefox)
+    image: mcr.microsoft.com/playwright:v1.49.0-jammy
+    container_name: ai-test-platform-ai-tester
+    # Mode CI strict : pas d'interaction utilisateur, exit codes respects
+    tty: false
+    stdin_open: false
+    working_dir: /app
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        echo "[ai-tester] Installation des dependances..."
+        yarn install --no-progress --frozen-lockfile || yarn install --no-progress
+        echo "[ai-tester] Lancement du crawler IA..."
+        yarn test:crawler
+    environment:
+      # Identifiants (toutes les valeurs sensibles vivent dans .env)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Modele Claude configurable (defaut : Sonnet 4.5 - surclassent 3.5)
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-4-5}
+      # Cible du crawler
+      TARGET_URL: ${TARGET_URL:-http://host.docker.internal:3000}
+      CRAWLER_MAX_STEPS: ${CRAWLER_MAX_STEPS:-10}
+      CRAWLER_GOAL: ${CRAWLER_GOAL:-Verifier que la page d'accueil se charge et que la navigation principale fonctionne}
+      # Options navigateur
+      HEADLESS: ${HEADLESS:-1}
+      # SMTP pour l'envoi du rapport
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+      # Artefacts : URL publique pour le lien dans l'email (artefact CI)
+      ARTIFACT_BASE_URL: ${ARTIFACT_BASE_URL:-https://gitlab.com/-/artifacts}
+      CI_PIPELINE_ID: ${CI_PIPELINE_ID:-local}
+      CI_JOB_ID: ${CI_JOB_ID:-local}
+      # Generaux
+      NODE_ENV: test
+      CI: "true"
+      # Limite de tokens / requetes pour evitar une explosion des couts
+      CLAUDE_MAX_TOKENS: ${CLAUDE_MAX_TOKENS:-2048}
+    volumes:
+      # Code source + tests
+      - ./:/app:rw
+      # Cache des navigateurs Playwright (pour accelerer les builds)
+      - playwright-browsers:/ms-playwright:rw
+      # Artefacts partages avec l'hote
+      - artifacts:/app/test-results:rw
+    networks:
+      - test-net
+    # DNS GitHub resolu sans conflit sur Linux
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    # Healthcheck : verifie que Playwright est installable
+    healthcheck:
+      test: ["CMD", "bash", "-c", "test -d /ms-playwright/chromium-1*"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Permet au conteneur de joindre le serveur hote en local (dev)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: "no"
+
+  # ------------------------------------------------------------
+  # load-tester : K6 de Grafana (tests de charge & scalabilite)
+  # Image officielle = k6 standalone, pas besoin de Dockerfile custom
+  # ------------------------------------------------------------
+  load-tester:
+    image: grafana/k6:latest
+    container_name: ai-test-platform-load-tester
+    command: ["run", "/tests/stress-test.js"]
+    environment:
+      # Cible du stress test
+      TARGET_URL: ${TARGET_URL:-http://host.docker.internal:3000}
+      # Seuils configurables
+      K6_MAX_VUS: ${K6_MAX_VUS:-200}
+      K6_RAMP_STAGES: ${K6_RAMP_STAGES:-30s:50,1m:100,30s:200,30s:0}
+      K6_P95_THRESHOLD_MS: ${K6_P95_THRESHOLD_MS:-2000}
+      K6_ERROR_RATE_THRESHOLD: ${K6_ERROR_RATE_THRESHOLD:-0.01}
+      # Sortie JSON pour integration CI
+      K6_OUT: json=results/stress-summary.json
+    volumes:
+      - ./tests:/tests:ro
+      - results:/results:rw
+    networks:
+      - test-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # K6 n'a pas de "healthcheck" utile : c'est un job batch.
+    restart: "no"
+
+# Volumes nommes pour la persistance (declaration globale au debut du fichier)

@@ -1,0 +1,60 @@
+# ==========================================================
+#  AI Test Platform - .gitignore (Node + Docker + Tests)
+# ==========================================================
+
+# Dependances Node / Yarn
+node_modules/
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Artefacts de tests Playwright (NE PAS versionner)
+test-results/
+results/
+playwright-report/
+playwright/.cache/
+
+# Couverture de code
+coverage/
+*.lcov
+*.coverage
+
+# Logs et dumps
+*.log
+logs/
+ci-runtime/
+
+# Variables d'environnement sensibles
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Fichiers IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Sorties K6
+k6-results/
+stress-summary.json
+
+# Cache navigateur Playwright (Docker)
+ms-playwright/
+
+# Fichiers de secrets
+*.pem
+*.key
+*.p12
+secrets/
