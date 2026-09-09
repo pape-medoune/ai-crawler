@@ -14,15 +14,25 @@
 //    3. Si goal non atteint apres N etapes -> exit 1
 //    4. Envoie un email HTML (Tailwind inline) avec lien vers artefacts
 //
+//  MODE BASIQUE (sans IA) :
+//    Si ANTHROPIC_API_KEY est absent, le test ne fait PAS de skip silencieux.
+//    Il execute a la place une serie de verifications Playwright deterministes
+//    (navigation, code HTTP, titre, contenu visible, liens, page d'erreur) qui
+//    produisent les memes rapports (HTML/JUnit/JSON) et le meme exit code 0/1.
+//    Cela permet d'utiliser le pipeline utilement avant d'avoir configure une
+//    cle API Claude. Des que ANTHROPIC_API_KEY est fourni, le mode IA prend
+//    automatiquement le relais, sans changement de configuration ailleurs.
+//
 //  Modele : configurable via env CLAUDE_MODEL (defaut claude-sonnet-4-5).
 //  Source de verite : claude-sonnet-4-5 surpasse 3.5 Sonnet sur le
 //    raisonnement JSON structure, sans surcout significatif.
 //
-//  Variables d'environnement requises :
-//    ANTHROPIC_API_KEY          -> cle d'API Claude (sinon skip)
+//  Variables d'environnement :
+//    ANTHROPIC_API_KEY          -> cle d'API Claude (optionnelle : sans elle,
+//                                  bascule automatiquement en mode basique)
 //    CLAUDE_MODEL               -> nom du modele (defaut ci-dessus)
 //    TARGET_URL                 -> URL de depart
-//    CRAWLER_GOAL               -> objectif en langage naturel
+//    CRAWLER_GOAL               -> objectif en langage naturel (mode IA)
 //    CRAWLER_MAX_STEPS          -> nombre max d'iterations (defaut 10)
 //    SMTP_*                     -> configuration du rapport par mail
 //    ARTIFACT_BASE_URL          -> URL publique des artefacts CI
@@ -226,6 +236,72 @@ async function executeAction(page, decision) {
 }
 
 /**
+ * Mode basique (sans IA) : execute une serie de verifications Playwright
+ * deterministes quand ANTHROPIC_API_KEY est absent. Chaque etape produit un
+ * enregistrement compatible avec le format utilise par le mode IA, afin que
+ * le rapport HTML/JUnit reste identique dans les deux modes.
+ *
+ * Checks effectues :
+ *   1. Navigation vers TARGET_URL + code de reponse HTTP 2xx/3xx
+ *   2. Titre de page non vide
+ *   3. Contenu visible (body) non vide
+ *   4. Presence d'au moins un lien de navigation (a[href])
+ *   5. Absence de texte evoquant une page d'erreur (500, 404, etc.)
+ */
+async function runBasicSmokeChecks(page) {
+  const steps = [];
+  let allOk = true;
+
+  function record(action, selector, reasoning, success) {
+    steps.push({
+      step: steps.length + 1,
+      action,
+      selector: selector || '',
+      value: '',
+      reasoning,
+      observation: success ? 'OK' : 'ECHEC',
+      success,
+      confidence: null,
+    });
+    if (!success) allOk = false;
+  }
+
+  // 1. Navigation + code de reponse HTTP
+  let response;
+  try {
+    response = await page.goto(CONFIG.targetUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    const status = response ? response.status() : 0;
+    record('navigate', CONFIG.targetUrl, `Reponse HTTP ${status}`, status >= 200 && status < 400);
+  } catch (err) {
+    record('navigate', CONFIG.targetUrl, `Echec de navigation: ${String(err.message || err)}`.slice(0, 300), false);
+    return { steps, goalAchieved: false };
+  }
+
+  // 2. Titre de page non vide
+  const title = await page.title().catch(() => '');
+  record('assert', 'title', `Titre de la page : "${title}"`, Boolean(title && title.trim().length > 0));
+
+  // 3. Contenu visible present
+  const bodyText = await page.locator('body').innerText().catch(() => '');
+  record('assert', 'body', `Longueur du contenu visible : ${bodyText.length} caracteres`, bodyText.trim().length > 0);
+
+  // 4. Au moins un lien de navigation
+  const linkCount = await page.locator('a[href]').count().catch(() => 0);
+  record('assert', 'a[href]', `${linkCount} lien(s) detecte(s)`, linkCount > 0);
+
+  // 5. Absence de page d'erreur evidente
+  const hasErrorText = /erreur 500|internal server error|cannot get|404 not found|application error/i.test(bodyText);
+  record(
+    'assert',
+    'body',
+    hasErrorText ? "Texte evoquant une page d'erreur detecte" : "Aucun texte d'erreur evident detecte",
+    !hasErrorText,
+  );
+
+  return { steps, goalAchieved: allOk };
+}
+
+/**
  * Appelle Claude avec la conversation courante. Utilise `tool use` pour
  * garantir une reponse JSON conforme au schema NEXT_ACTION_TOOL.
  */
@@ -252,7 +328,7 @@ async function callClaude(client, systemPrompt, messages) {
  * Construit le rapport HTML inline (Tailwind via classes) pour l'email.
  * Version inline : pas de dependance externe, classes Tailwind compilees a la main.
  */
-function buildHtmlReport({ finalStatus, steps, artifactLinks, durationMs }) {
+function buildHtmlReport({ finalStatus, steps, artifactLinks, durationMs, mode }) {
   const stepRows = steps
     .map(
       (s) => `
@@ -286,7 +362,7 @@ function buildHtmlReport({ finalStatus, steps, artifactLinks, durationMs }) {
       </span>
     </p>
     <ul>
-      <li><strong>Modele</strong> : ${escape(CONFIG.claudeModel)}</li>
+      <li><strong>Mode</strong> : ${mode === 'ia' ? `IA (${escape(CONFIG.claudeModel)})` : 'Basique (sans IA - checks deterministes)'}</li>
       <li><strong>Pipeline</strong> : #${escape(CONFIG.pipelineId)} / job #${escape(CONFIG.jobId)}</li>
       <li><strong>Duree</strong> : ${(durationMs / 1000).toFixed(1)} s</li>
       <li><strong>Steps executes</strong> : ${steps.length}</li>
@@ -334,7 +410,7 @@ function buildArtifactLinks() {
  * Envoie l'email de rapport avec HTML Tailwind inline + lien vers artefacts.
  * Si SMTP non configure, logge un warning et continue (le pipeline reste fonctionnel).
  */
-async function sendReport({ finalStatus, steps, durationMs }) {
+async function sendReport({ finalStatus, steps, durationMs, mode }) {
   if (!CONFIG.smtp.host || !CONFIG.smtp.user || !CONFIG.smtp.to) {
     console.warn('[mail] SMTP non configure -> email non envoye (pipeline OK).');
     return { sent: false };
@@ -348,10 +424,11 @@ async function sendReport({ finalStatus, steps, durationMs }) {
   });
 
   const artifactLinks = buildArtifactLinks();
-  const html = buildHtmlReport({ finalStatus, steps, artifactLinks, durationMs });
+  const html = buildHtmlReport({ finalStatus, steps, artifactLinks, durationMs, mode });
+  const modeLabel = mode === 'ia' ? 'IA' : 'basique';
   const subject = finalStatus === 0
-    ? `[OK] AI Crawler - ${CONFIG.targetUrl}`
-    : `[KO] AI Crawler - ${CONFIG.targetUrl}`;
+    ? `[OK] AI Crawler (mode ${modeLabel}) - ${CONFIG.targetUrl}`
+    : `[KO] AI Crawler (mode ${modeLabel}) - ${CONFIG.targetUrl}`;
 
   await transporter.sendMail({
     from: CONFIG.smtp.from || CONFIG.smtp.user,
@@ -373,6 +450,9 @@ const runState = {
   startedAt: Date.now(),
   steps: [],
   artifacts: {},
+  // Rempli juste avant le expect() final ; sert de source de verite unique
+  // pour le hook afterAll (evite de deviner l'issue depuis le contenu des steps).
+  finalStatus: null,
 };
 
 // ============================================================
@@ -382,14 +462,35 @@ const runState = {
 test('AI Crawler Universal', async ({ page }) => {
   test.setTimeout(CONFIG.maxSteps * 60_000); // ~60s/etape max
 
-  // 1. Sanity : cle API obligatoire (sinon on sort proprement)
-  if (!CONFIG.apiKey) {
-    console.error('[fatal] ANTHROPIC_API_KEY manquant. Skipping.');
-    test.skip(true, 'ANTHROPIC_API_KEY non fournie');
+  const mode = CONFIG.apiKey ? 'ia' : 'basique';
+
+  // ----------------------------------------------------------
+  // MODE BASIQUE (sans IA) : ANTHROPIC_API_KEY absent.
+  // On execute des checks deterministes au lieu de sauter le test,
+  // pour que le pipeline reste utile en attendant la cle API.
+  // ----------------------------------------------------------
+  if (mode === 'basique') {
+    console.warn('[ai-crawler] ANTHROPIC_API_KEY absent -> mode basique (checks deterministes, sans IA).');
+    const { steps, goalAchieved } = await runBasicSmokeChecks(page);
+    runState.steps.push(...steps);
+
+    const finalStatus = goalAchieved ? 0 : 1;
+    runState.finalStatus = finalStatus;
+
+    await sendReport({
+      finalStatus,
+      steps: runState.steps,
+      durationMs: Date.now() - runState.startedAt,
+      mode,
+    });
+
+    expect(goalAchieved, `Checks basiques echoues apres ${runState.steps.length} etapes (mode sans IA).`).toBe(true);
     return;
   }
 
-  // 2. Initialisation Claude
+  // ----------------------------------------------------------
+  // MODE IA : ANTHROPIC_API_KEY present.
+  // ----------------------------------------------------------
   const client = new Anthropic({ apiKey: CONFIG.apiKey });
   const systemPrompt = buildSystemPrompt(CONFIG.goal);
 
@@ -411,10 +512,12 @@ test('AI Crawler Universal', async ({ page }) => {
     } catch (err) {
       console.error(`[step ${step}] appel Claude KO: ${err.message}`);
       // Erreur critique = exit 1 (le pipeline CI doit bloquer)
+      runState.finalStatus = 1;
       await sendReport({
         finalStatus: 1,
         steps: runState.steps,
         durationMs: Date.now() - runState.startedAt,
+        mode,
       });
       process.exit(1);
     }
@@ -455,12 +558,14 @@ test('AI Crawler Universal', async ({ page }) => {
   // 4. Decision finale : on a-t-on atteint l'objectif ?
   const finalGoal = runState.steps.some((s) => s.observation === 'goal_achieved');
   const finalStatus = finalGoal ? 0 : 1;
+  runState.finalStatus = finalStatus;
 
   // 5. Envoi du rapport mail
   await sendReport({
     finalStatus,
     steps: runState.steps,
     durationMs: Date.now() - runState.startedAt,
+    mode,
   });
 
   // 6. Assertion finale -> process.exit gere par Playwright via expect
@@ -470,6 +575,8 @@ test('AI Crawler Universal', async ({ page }) => {
 
 // Hook : a la fin du run, on force le exit-code meme en cas d'erreur non capturee.
 // (Playwright termine naturellement, mais ce filet de securite garantit le code CI.)
+// runState.finalStatus est la source de verite (posee explicitement par les deux
+// modes avant le expect() final) ; par defaut 1 (echec) si jamais rien ne l'a fixe.
 test.afterAll(async () => {
-  process.exit(runState.steps.some((s) => s.observation === 'goal_achieved') ? 0 : 1);
+  process.exit(runState.finalStatus === 0 ? 0 : 1);
 });
